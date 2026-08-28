@@ -32,6 +32,44 @@ ANTHROPIC_MODEL = "claude-sonnet-4-6"
 COLD_START_BACKFILL = 5
 
 # ---------------------------------------------------------------------------
+# Kalshi augmentation (the "vavi.ks" second copy) — see kalshi.py
+# ---------------------------------------------------------------------------
+# Recipient lists (all in .env; see .env.example for the full description):
+#   EMAIL_TO       -> shared "everyone" list. Sentinel emails it; plain Vavi
+#                     falls back to it when EMAIL_TO_VAVI is unset.
+#   EMAIL_TO_VAVI  -> plain-Vavi subset (no Kalshi section).
+#   EMAIL_TO_KS    -> Vavi.ks subset (augmented copy).
+# The plain-Vavi and Vavi.ks emails are two independent messages, so keep
+# EMAIL_TO_VAVI and EMAIL_TO_KS disjoint — nobody on both.
+#
+# When a post passes Vavi's relevance gate, the plain email goes out first and
+# UNCHANGED. If KS_ENABLED and EMAIL_TO_KS is set, the augmented copy (same body
+# + a "Relevant Kalshi markets" section) is then sent to EMAIL_TO_KS. Kalshi
+# reads are public — no API key. Turn the whole feature off here (or by leaving
+# EMAIL_TO_KS empty) for byte-identical old behavior.
+KS_ENABLED = True
+
+# Kalshi public read API (no auth needed for reads).
+KALSHI_BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
+
+# How many Kalshi markets to attach to an email, at most.
+KS_MAX_MARKETS = 3
+
+# Markets are fetched on demand — only for posts that clear the relevance gate,
+# and only the curated series that match the post's category/entities (see the
+# seed map in kalshi.py). Fetched series are cached in-process for this many
+# seconds so a burst of same-category posts doesn't refetch; short, so emailed
+# prices stay fresh. Relevant posts are rare, so this is a few API calls a day.
+KS_SERIES_TTL_SECONDS = 900
+
+# Safety cap on markets pulled per series (series are small, ~30-60 open each).
+KS_MARKETS_PER_SERIES = 200
+
+# Politeness delay (seconds) after each per-series network fetch, to stay under
+# Kalshi's public rate limit. Skipped on cache hits.
+KS_FETCH_PACE_SECONDS = 0.3
+
+# ---------------------------------------------------------------------------
 # Cheap keyword pre-filter (NO LLM)
 # ---------------------------------------------------------------------------
 # A post must contain at least one of these (case-insensitive, word-ish match)

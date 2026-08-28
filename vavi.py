@@ -30,6 +30,7 @@ from datetime import datetime, timezone
 from email.message import EmailMessage
 
 import config
+import kalshi
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_DB = os.path.join(HERE, "vavi.db")
@@ -375,14 +376,16 @@ def email_subject(post, c):
     return f"Vavi {tag} {ents}".strip()
 
 
-def email_body(post, c):
+def email_body(post, c, extra_section=""):
+    """The email body. `extra_section` (default "") is appended after the
+    disclaimer; with the default the output is byte-for-byte today's."""
     ents = c.get("entities") or []
     ent_lines = "\n".join(
         f"  - {e.get('name')} "
         f"({e.get('ticker') or 'n/a'}, {e.get('type') or '?'})"
         for e in ents
     ) or "  (none identified)"
-    return (
+    body = (
         f"Trump post — {post['created_at']}\n"
         f"{post['url']}\n\n"
         f"{post['text']}\n\n"
@@ -397,14 +400,30 @@ def email_body(post, c):
         f"This characterizes possible market relevance. It is not financial "
         f"advice and contains no price prediction.\n"
     )
+    if extra_section:
+        body += "\n" + extra_section
+    return body
 
 
-def send_email(post, c, env):
+def vavi_recipient(env):
+    """The plain-Vavi list. EMAIL_TO_VAVI if set, else EMAIL_TO. Keeping this
+    separate from EMAIL_TO lets EMAIL_TO stay the shared "everyone" list that
+    Sentinel emails, while plain Vavi (EMAIL_TO_VAVI) and Vavi.ks (EMAIL_TO_KS)
+    address their own subsets. Unset EMAIL_TO_VAVI => falls back to EMAIL_TO, so
+    an existing single-list setup is unchanged."""
+    return env.get("EMAIL_TO_VAVI") or env.get("EMAIL_TO")
+
+
+def send_email(post, c, env, to=None, extra_section=""):
+    """Send one email. Recipient defaults to the plain-Vavi list
+    (EMAIL_TO_VAVI or EMAIL_TO); pass `to` for a different recipient (e.g. the
+    Kalshi-augmented EMAIL_TO_KS) and `extra_section` to append a block to the
+    body."""
     msg = EmailMessage()
     msg["Subject"] = email_subject(post, c)
     msg["From"] = env["EMAIL_FROM"]
-    msg["To"] = env["EMAIL_TO"]
-    msg.set_content(email_body(post, c))
+    msg["To"] = to or vavi_recipient(env)
+    msg.set_content(email_body(post, c, extra_section))
 
     host = env.get("SMTP_HOST", "smtp.gmail.com")
     port = int(env.get("SMTP_PORT", "587"))
@@ -443,6 +462,11 @@ def run_once(store, env, no_email=False, classify_enabled=True):
     twice is a no-op for the second run."""
     posts = fetch_posts()
     log(f"fetched {len(posts)} posts")
+
+    # Whether to also send the Kalshi-augmented copy. Kalshi markets are
+    # fetched on demand per relevant post (in the branch below), so there is
+    # nothing to prepare here.
+    ks_on = bool(config.KS_ENABLED and env.get("EMAIL_TO_KS"))
 
     if store.count_seen() == 0:
         cold_start_backfill(store, posts)
@@ -488,17 +512,48 @@ def run_once(store, env, no_email=False, classify_enabled=True):
                     f"{classification.get('magnitude')} "
                     f"noise={classification.get('is_noise')} "
                     f"conf={classification.get('confidence')} relevant={rel}")
-                if rel and not no_email:
-                    try:
-                        send_email(p, classification, env)
-                        did_notify = True
-                        notified += 1
-                        log(f"  emailed: {email_subject(p, classification)}")
-                    except Exception as e:  # noqa: BLE001
-                        log(f"  email error: {e}")
-                elif rel and no_email:
-                    log(f"  [no-email] would send: "
-                        f"{email_subject(p, classification)}")
+                if rel:
+                    subj = email_subject(p, classification)
+                    vavi_to = vavi_recipient(env)
+                    # 1) The regular email goes out FIRST and UNCHANGED, in its
+                    #    own try/except — Kalshi work below can never touch it.
+                    if not no_email:
+                        try:
+                            send_email(p, classification, env, to=vavi_to)
+                            did_notify = True
+                            notified += 1
+                            log(f"  emailed: {subj}")
+                        except Exception as e:  # noqa: BLE001
+                            log(f"  email error: {e}")
+                    else:
+                        log(f"  [no-email] would send -> {vavi_to}: {subj}")
+
+                    # 2) Second, Kalshi-augmented copy to EMAIL_TO_KS. Fully
+                    #    isolated: any Kalshi failure just drops the section.
+                    if ks_on:
+                        section = ""
+                        try:
+                            section = kalshi.render_section(
+                                kalshi.find_markets(classification))
+                        except Exception as e:  # noqa: BLE001
+                            log(f"  kalshi section error "
+                                f"(sending .ks without it): {e}")
+                        tag = "with" if section else "no"
+                        if not no_email:
+                            try:
+                                send_email(p, classification, env,
+                                           to=env["EMAIL_TO_KS"],
+                                           extra_section=section)
+                                log(f"  emailed .ks -> {env['EMAIL_TO_KS']} "
+                                    f"({tag} Kalshi section)")
+                            except Exception as e:  # noqa: BLE001
+                                log(f"  .ks email error: {e}")
+                        else:
+                            log(f"  [no-email] would send .ks -> "
+                                f"{env['EMAIL_TO_KS']} ({tag} Kalshi section): "
+                                f"{subj}")
+                            for ln in section.splitlines():
+                                log(f"      | {ln}")
 
         store.log_post(p, True, matched, classification, did_notify)
         store.mark_seen(p)
@@ -539,9 +594,15 @@ def main(argv=None):
     if not args.no_email:
         require_env(
             env,
-            ["EMAIL_FROM", "EMAIL_TO", "SMTP_PASSWORD"],
+            ["EMAIL_FROM", "SMTP_PASSWORD"],
             "SMTP / email config (or pass --no-email)",
         )
+        # Plain Vavi needs a recipient list: EMAIL_TO_VAVI, or EMAIL_TO as the
+        # fallback / shared "everyone" list.
+        if not vavi_recipient(env):
+            log("ERROR: set EMAIL_TO_VAVI (or EMAIL_TO) in .env, "
+                "or pass --no-email")
+            sys.exit(2)
 
     store = Store(args.db)
     try:

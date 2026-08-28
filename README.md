@@ -19,12 +19,21 @@ poll archive (~2 min)
   → LLM classify survivors only       (Anthropic claude-sonnet-4-6, strict JSON)
   → log everything to SQLite
   → email the relevant ones           (signal in the subject line)
+       ├─ plain copy               → EMAIL_TO_VAVI
+       └─ optional "vavi.ks" copy  → EMAIL_TO_KS  (+ live Kalshi markets,
+                                                    reusing the same classify —
+                                                    no extra LLM call)
 ```
 
 The keyword pre-filter is deliberately high-recall and cheap, so the only posts
 that cost an API call are the ones with a plausible market hook. On the live
 archive it lets through ~9% of posts; the LLM then marks campaign/grievance
 survivors as `is_noise` and they are suppressed.
+
+Optionally, each relevant post can also be sent as a **second, augmented copy**
+to a separate list, with a short list of live, on-topic **Kalshi** prediction
+markets appended. See [The `vavi.ks` copy](#the-vaviks-copy-live-kalshi-markets)
+below. It is off unless configured, and the plain email is never affected.
 
 ## Data source
 
@@ -56,9 +65,23 @@ cp .env.example .env      # then fill in your keys (see below)
 `.env` keys:
 
 - `ANTHROPIC_API_KEY` — required unless you run `--no-classify`.
-- `EMAIL_FROM`, `EMAIL_TO`, `SMTP_PASSWORD` (+ optional `SMTP_HOST`, `SMTP_PORT`,
+- `EMAIL_FROM`, `SMTP_PASSWORD` (+ optional `SMTP_HOST`, `SMTP_PORT`,
   `SMTP_USER`) — required unless you run `--no-email`. Defaults target Gmail; for
   Gmail use a **16-char App Password**, not your account password.
+- **Recipient lists** (each may be a comma-separated list of addresses):
+  - `EMAIL_TO` — the shared **"everyone"** list. **Sentinel** emails it, and
+    plain Vavi **falls back** to it when `EMAIL_TO_VAVI` is unset.
+  - `EMAIL_TO_VAVI` — the **plain-Vavi** subset (no Kalshi section). Optional;
+    unset ⇒ plain Vavi uses `EMAIL_TO`.
+  - `EMAIL_TO_KS` — the **vavi.ks** subset (gets the augmented copy). Optional;
+    unset ⇒ no second copy is ever sent.
+
+  The plain-Vavi and vavi.ks emails are two independent messages, so keep
+  `EMAIL_TO_VAVI` and `EMAIL_TO_KS` **disjoint** — nobody on both. For
+  *"everyone gets Sentinel; each person gets vavi OR vavi.ks"*, set `EMAIL_TO` =
+  the union, `EMAIL_TO_VAVI` = the plain folk, `EMAIL_TO_KS` = the Kalshi folk.
+  For the original single-list behavior, just set `EMAIL_TO` and leave the other
+  two empty.
 
 ## Run
 
@@ -103,6 +126,53 @@ forward. Tune in `config.py`.
 Everything tunable lives in **`config.py`**: poll interval, the keyword
 pre-filter terms, the macro / geo / commodity gazetteers, and the
 company→ticker map. That's the one file to edit to broaden or narrow coverage.
+
+## The `vavi.ks` copy (live Kalshi markets)
+
+Optional augmentation (`kalshi.py`). When a post clears the relevance gate, the
+plain email is sent **first and unchanged** to the Vavi list; then — only if
+`KS_ENABLED` and `EMAIL_TO_KS` is set — a **second, separate** email with the
+identical body plus a **"Relevant Kalshi markets"** block goes to `EMAIL_TO_KS`.
+It reuses the classification already in memory, so it costs **no extra LLM
+call**, and (like the rest of Vavi) it is **stdlib-only** — Kalshi's read API is
+public, no key needed.
+
+**How it finds markets — category-scoped, fetch-on-demand.** A Trump post only
+falls into a handful of market buckets (macro/monetary, tariff/trade, commodity,
+country/geopolitical, company), so there is no need to index all of Kalshi
+(100k+ open markets, mostly auto-generated sports parlays). Instead:
+
+1. The post's `category` + `entities` are mapped to a small set of curated
+   Kalshi **series** via a hand-built seed map in `kalshi.py` (e.g.
+   monetary → `KXFEDDECISION`, oil → `KXWTIW`, Iran → `KXIRANCRUDE`).
+2. Only those series' open markets are listed (one public API call each),
+   cached in-process for `KS_SERIES_TTL_SECONDS` so a burst of same-category
+   posts doesn't refetch. Because relevant posts are rare, this is a few API
+   calls a day, and prices are fresh at send time.
+3. The pooled markets are ranked by title relevance (then nearest close, then
+   probability) and the top `KS_MAX_MARKETS` are rendered — each with its
+   current Yes/No price, close date, and a link.
+
+**Fail-open and isolated.** The plain email always goes out first, in its own
+try/except; all Kalshi work is wrapped, so a Kalshi outage, a bad host, or any
+error just sends the `.ks` copy **without** the section — the plain alert is
+never affected or delayed.
+
+**Recipient model.** See the three lists (`EMAIL_TO`, `EMAIL_TO_VAVI`,
+`EMAIL_TO_KS`) under [Install](#install). Sentinel uses `EMAIL_TO`; plain Vavi
+uses `EMAIL_TO_VAVI` (falling back to `EMAIL_TO`); the augmented copy uses
+`EMAIL_TO_KS`.
+
+**Tuning (`config.py`).** `KS_ENABLED` (master switch), `KS_MAX_MARKETS` (3),
+`KS_SERIES_TTL_SECONDS` (900), `KS_MARKETS_PER_SERIES`, `KS_FETCH_PACE_SECONDS`,
+`KALSHI_BASE_URL`. The curated series seed map (`CATEGORY_SERIES` / `TERM_SERIES`)
+lives in `kalshi.py` — add series there to broaden coverage. Standalone check:
+`python3 kalshi.py --demo`.
+
+> **Known gap:** the `company` category returns nothing today — Kalshi has no
+> liquid per-company markets to map — so a company post gets the `.ks` email
+> with no section (correct fail behavior). macro, country, and commodity are
+> well covered.
 
 ## Running 24/7 on AWS (EC2)
 
