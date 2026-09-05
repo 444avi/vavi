@@ -18,11 +18,10 @@ poll archive (~2 min)
   → cheap keyword pre-filter (NO LLM) (drops ~90% — political grievance, etc.)
   → LLM classify survivors only       (Anthropic claude-sonnet-4-6, strict JSON)
   → log everything to SQLite
-  → email the relevant ones           (signal in the subject line)
-       ├─ plain copy               → EMAIL_TO_VAVI
-       └─ optional "vavi.ks" copy  → EMAIL_TO_KS  (+ live Kalshi markets,
-                                                    reusing the same classify —
-                                                    no extra LLM call)
+  → store one canonical event
+  → apply saved user preferences      (no new source, market-data, or LLM work)
+  → send now or queue a private digest
+       └─ optional Kalshi section      (fetched once per event and cached)
 ```
 
 The keyword pre-filter is deliberately high-recall and cheap, so the only posts
@@ -30,10 +29,10 @@ that cost an API call are the ones with a plausible market hook. On the live
 archive it lets through ~9% of posts; the LLM then marks campaign/grievance
 survivors as `is_noise` and they are suppressed.
 
-Optionally, each relevant post can also be sent as a **second, augmented copy**
-to a separate list, with a short list of live, on-topic **Kalshi** prediction
-markets appended. See [The `vavi.ks` copy](#the-vaviks-copy-live-kalshi-markets)
-below. It is off unless configured, and the plain email is never affected.
+Each Vavi preference can optionally append a short list of live, on-topic
+**Kalshi** prediction markets. See [Kalshi email content](#kalshi-email-content)
+below. Enrichment is downstream of every filter, cached once on the canonical
+event, and never changes the normal notification when it fails.
 
 ## Data source
 
@@ -55,7 +54,7 @@ JSON **list**, newest-first, ~34k posts. Verified fields:
 ## Install
 
 Stdlib-only — **no `pip install` required**, even for the Anthropic call (it uses
-`urllib`). Any Python 3.8+ works.
+`urllib`). Python 3.9+ is required for the standard-library IANA timezone data.
 
 ```bash
 cd vavi
@@ -68,7 +67,7 @@ cp .env.example .env      # then fill in your keys (see below)
 - `EMAIL_FROM`, `SMTP_PASSWORD` (+ optional `SMTP_HOST`, `SMTP_PORT`,
   `SMTP_USER`) — required unless you run `--no-email`. Defaults target Gmail; for
   Gmail use a **16-char App Password**, not your account password.
-- **Recipient lists** (each may be a comma-separated list of addresses):
+- **Legacy recipient lists** (each may be a comma-separated list of addresses):
   - `EMAIL_TO` — the shared **"everyone"** list. **Sentinel** emails it, and
     plain Vavi **falls back** to it when `EMAIL_TO_VAVI` is unset.
   - `EMAIL_TO_VAVI` — the **plain-Vavi** subset (no Kalshi section). Optional;
@@ -76,12 +75,15 @@ cp .env.example .env      # then fill in your keys (see below)
   - `EMAIL_TO_KS` — the **vavi.ks** subset (gets the augmented copy). Optional;
     unset ⇒ no second copy is ever sent.
 
-  The plain-Vavi and vavi.ks emails are two independent messages, so keep
-  `EMAIL_TO_VAVI` and `EMAIL_TO_KS` **disjoint** — nobody on both. For
+  These lists seed verified users and default preferences into `app.db` on the
+  first run. Saved settings are authoritative afterward and startup never
+  overwrites a user's choices. For
   *"everyone gets Sentinel; each person gets vavi OR vavi.ks"*, set `EMAIL_TO` =
   the union, `EMAIL_TO_VAVI` = the plain folk, `EMAIL_TO_KS` = the Kalshi folk.
   For the original single-list behavior, just set `EMAIL_TO` and leave the other
-  two empty.
+  two empty. Also set `APP_DEFAULT_TIMEZONE` to the seeded user's IANA timezone,
+  `SETTINGS_PUBLIC_URL` to the operator-controlled settings URL, and
+  `ADMIN_EMAIL_TO` to the separate address for Sentinel source-health warnings.
 
 ## Run
 
@@ -108,7 +110,9 @@ Flags (`python3 vavi.py --help`):
 | `--once` | single pass and exit. **Idempotent / cron-safe**: already-seen posts are skipped, so a second run is a no-op |
 | `--no-email` | classify and log, but never send (dry run) |
 | `--no-classify` | poll + dedup + pre-filter only; no API calls, no cost |
+| `--legacy-delivery` | temporary rollback to direct environment-list delivery |
 | `--db PATH` | override the SQLite path (default `vavi.db` next to the script) |
+| `--app-db PATH` | override the shared settings/delivery database (default `app.db`) |
 | `--env PATH` | override the `.env` path (default next to the script) |
 
 > **If systemd (or cron) is already running the forever-loop, never start a
@@ -127,15 +131,37 @@ Everything tunable lives in **`config.py`**: poll interval, the keyword
 pre-filter terms, the macro / geo / commodity gazetteers, and the
 company→ticker map. That's the one file to edit to broaden or narrow coverage.
 
-## The `vavi.ks` copy (live Kalshi markets)
+## Notification settings
 
-Optional augmentation (`kalshi.py`). When a post clears the relevance gate, the
-plain email is sent **first and unchanged** to the Vavi list; then — only if
-`KS_ENABLED` and `EMAIL_TO_KS` is set — a **second, separate** email with the
-identical body plus a **"Relevant Kalshi markets"** block goes to `EMAIL_TO_KS`.
-It reuses the classification already in memory, so it costs **no extra LLM
-call**, and (like the rest of Vavi) it is **stdlib-only** — Kalshi's read API is
-public, no key needed.
+Start the local settings service, then open `http://127.0.0.1:8787` through an
+operator-controlled tunnel:
+
+```bash
+python3 settings_server.py
+```
+
+The single page controls Vavi and Sentinel independently: enabled state,
+categories, delivery mode, quiet hours, direction, minimum significance,
+digest time, Vavi's Kalshi section, and Sentinel update emails. It also shows
+static previews and supports a local unsubscribe. There is intentionally no
+public login/session layer in the current single-user phase; keep the listener
+on loopback or behind the same operator-only boundary used for `.env`.
+
+`app.db` is opened in WAL mode by both monitors and contains verified users,
+preferences, canonical notification events, and auditable per-user delivery
+records. Settings apply only when a new canonical event is created; changing a
+setting never replays history. `delivery_worker.py` is the single shared process
+for immediate work, retries, once-per-event Kalshi enrichment, and timezone-aware
+digests; the monitor processes never do per-user network work.
+
+## Kalshi email content
+
+Optional augmentation lives in `kalshi.py`. After a post clears the relevance
+gate and user filters, the shared worker checks whether any matched recipient
+has the Kalshi content option enabled. If so, it fetches at most once for that
+canonical event, stores the result on `app.db`, and reuses it for every matching
+delivery. It reuses the classification already in memory, so it costs **no
+extra LLM call**. Kalshi's read API is public; no key is needed.
 
 **How it finds markets — category-scoped, fetch-on-demand.** A Trump post only
 falls into a handful of market buckets (macro/monetary, tariff/trade, commodity,
@@ -153,15 +179,13 @@ country/geopolitical, company), so there is no need to index all of Kalshi
    probability) and the top `KS_MAX_MARKETS` are rendered — each with its
    current Yes/No price, close date, and a link.
 
-**Fail-open and isolated.** The plain email always goes out first, in its own
-try/except; all Kalshi work is wrapped, so a Kalshi outage, a bad host, or any
-error just sends the `.ks` copy **without** the section — the plain alert is
-never affected or delayed.
+**Fail-open and isolated.** All Kalshi work is wrapped and the result, including
+an empty or failed result, is cached for the event. A Kalshi outage simply sends
+the normal Vavi email without the section.
 
-**Recipient model.** See the three lists (`EMAIL_TO`, `EMAIL_TO_VAVI`,
-`EMAIL_TO_KS`) under [Install](#install). Sentinel uses `EMAIL_TO`; plain Vavi
-uses `EMAIL_TO_VAVI` (falling back to `EMAIL_TO`); the augmented copy uses
-`EMAIL_TO_KS`.
+**Recipient migration.** See the three legacy lists (`EMAIL_TO`,
+`EMAIL_TO_VAVI`, `EMAIL_TO_KS`) under [Install](#install). They select the
+initial preferences only. After seeding, the UI and `app.db` are authoritative.
 
 **Tuning (`config.py`).** `KS_ENABLED` (master switch), `KS_MAX_MARKETS` (3),
 `KS_SERIES_TTL_SECONDS` (900), `KS_MARKETS_PER_SERIES`, `KS_FETCH_PACE_SECONDS`,
@@ -176,7 +200,7 @@ lives in `kalshi.py` — add series there to broaden coverage. Standalone check:
 
 ## Running 24/7 on AWS (EC2)
 
-Both services are always-on pollers with **local SQLite state that must
+The services use **local SQLite state that must
 persist** and must never run as two copies at once — so a single small EC2
 instance running the existing systemd units is the natural home: no code
 changes, and the dedup databases sit on the instance's EBS volume.
@@ -188,8 +212,8 @@ changes, and the dedup databases sit on the instance's EBS volume.
   on-demand.
 - **AMI:** Amazon Linux 2023 (ships Python 3.9+ and systemd; the app is
   stdlib-only, so there's no `pip` step). Ubuntu works too.
-- **Storage:** the default gp3 root volume is fine — `vavi.db` and
-  `sentinel.db` live on it and survive stop/start and reboot. **Don't
+- **Storage:** the default gp3 root volume is fine — `vavi.db`, `sentinel.db`,
+  and `app.db` live on it and survive stop/start and reboot. **Don't
   terminate the instance** without copying the DBs off first; take an
   occasional EBS snapshot if you want to keep the history.
 - Leave IMDSv2 set to *required* (the default on new launches).
@@ -209,10 +233,10 @@ sudo dnf install -y git             # or rsync the code up from your Mac instead
 git clone <your-repo> ~/vavi && cd ~/vavi
 cp .env.example .env                # then fill in the keys
 
-sudo cp vavi.service sentinel.service /etc/systemd/system/
+sudo cp vavi.service sentinel.service delivery.service settings.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now vavi sentinel
-journalctl -u vavi -u sentinel -f   # watch both logs
+sudo systemctl enable --now vavi sentinel delivery settings
+journalctl -u vavi -u sentinel -u delivery -u settings -f
 ```
 
 The bundled units already target `User=ec2-user` and `/home/ec2-user/vavi`;
@@ -233,33 +257,34 @@ writes on purpose — per-row commits fsync on every row and can hang the
 The master copy of the code stays at `/Users/avi/vavi`; deploy it to the
 instance and restart the units (see **Update the code** below).
 
-## Command reference — both services
+## Command reference — services
 
-Two services run side by side: **`vavi`** (Trump posts) and **`sentinel`**
-(unscheduled events). They are independent systemd units with separate
-databases but share one `.env` and one folder.
+Four services run side by side: **`vavi`** (Trump posts), **`sentinel`**
+(unscheduled events), **`delivery`** (shared outbound worker), and **`settings`**
+(loopback UI/API). They share one `.env` and folder; only the two monitors poll
+external sources.
 
 **Two rules that cover the common mistakes:**
 
 1. **`cd` into the project directory before running anything by hand.** The
    scripts aren't in your home directory.
-2. **systemd is already running both forever-loops.** Never launch a bare
+2. **systemd is already running the forever-loops.** Never launch a bare
    `python3 vavi.py` / `python3 sentinel.py` — you would get a second instance
    polling, emailing, and writing the same database in parallel. Manual passes
    always take `--once --no-email`.
 
 ### Service control
 
-Every command takes `vavi`, `sentinel`, or both space-separated.
+Every command takes one or more unit names.
 
 Run these on the host (or wrap them in your SSH invocation):
 
 ```bash
-systemctl is-active vavi sentinel      # running? -> "active" twice
-systemctl status vavi sentinel         # detail: uptime, PID, last log lines
-sudo systemctl stop vavi sentinel      # off until next reboot
-sudo systemctl start vavi sentinel     # on
-sudo systemctl restart vavi sentinel   # apply new code / config
+systemctl is-active vavi sentinel delivery settings
+systemctl status vavi sentinel delivery settings
+sudo systemctl stop vavi sentinel delivery settings
+sudo systemctl start vavi sentinel delivery settings
+sudo systemctl restart vavi sentinel delivery settings
 sudo systemctl disable --now sentinel  # off, and stays off after reboot
 sudo systemctl enable --now sentinel   # on, auto-start at boot
 ```
@@ -269,10 +294,12 @@ sudo systemctl enable --now sentinel   # on, auto-start at boot
 ```bash
 journalctl -u vavi -f                  # live Vavi log (Ctrl-C stops watching, not the service)
 journalctl -u sentinel -f              # live Sentinel log
+journalctl -u delivery -f              # sends, digests, retries, Kalshi cache
+journalctl -u settings -f              # settings API requests
 journalctl -u sentinel --no-pager -n 50        # last 50 lines, no follow
 journalctl -u vavi --since "1 hour ago"        # time-bounded
 journalctl -u sentinel -p err --no-pager       # errors only
-journalctl -u vavi | grep "emailed"            # what actually alerted
+journalctl -u delivery | grep "delivered"      # immediate deliveries
 ```
 
 ### Manual passes (safe alongside the running services)
@@ -283,6 +310,8 @@ python3 vavi.py --once --no-email        # Vavi: one pass, no send
 python3 sentinel.py --once --no-email    # Sentinel: one pass, no send
 python3 sentinel.py --once --no-email --no-llm --source edgar   # cheapest possible check
 python3 sentinel.py --digest-now         # send the pending digest now
+python3 delivery_worker.py --once        # process currently due work once
+python3 delivery_worker.py --force-digests  # flush all non-empty due/future groups
 ```
 
 These are safe because both databases dedup: anything the service already
@@ -296,9 +325,10 @@ fires.)
 ### Health check (one paste)
 
 ```bash
-systemctl is-active vavi sentinel
+systemctl is-active vavi sentinel delivery settings
 journalctl -u vavi --no-pager -n 2 -o cat
 journalctl -u sentinel --no-pager -n 2 -o cat
+journalctl -u delivery --no-pager -n 2 -o cat
 free -m | head -2; df -h / | tail -1
 ```
 
@@ -316,7 +346,7 @@ Mac over SSH instead:
 ```bash
 rsync -a --exclude '__pycache__' --exclude '*.db*' \
   /Users/avi/vavi/ ec2-user@<instance>:~/vavi/
-ssh ec2-user@<instance> sudo systemctl restart vavi sentinel
+ssh ec2-user@<instance> sudo systemctl restart vavi sentinel delivery settings
 ```
 
 (`--exclude '*.db*'` matters: never overwrite the instance's dedup databases.)
@@ -331,6 +361,11 @@ Restart only the service whose code you touched if you prefer — editing
   re-notify.
 - `posts` — a log of every processed survivor: pre-filter result, the full
   classification, and whether it was emailed. Useful for tuning.
+
+`app.db` is the shared delivery-facing store. It contains users, monitor
+preferences, category/direction selections, canonical events, and per-user
+delivery state. Keep it on the same persistent volume and include it in backups;
+never copy a development DB over the live file.
 
 ## Scope
 
@@ -396,6 +431,13 @@ Finnhub (`stock/profile2`; free key `FINNHUB_API_KEY` in `.env`) and cached in
 lookup runs **only for events that would otherwise notify** (email / update /
 digest), so the low-tier `log` flood never touches the API; with weekly
 caching the request volume is a handful of tickers a day.
+
+Each user can raise that floor from **$1B to $1T** with the Sentinel market-cap
+slider in notification settings. Sentinel resolves the cap once and stores it
+on the canonical event before the shared evaluator applies each user's saved
+threshold, so recipients do not multiply Finnhub requests. A user threshold
+can narrow the global feed but cannot opt into companies below the production
+floor.
 
 **Fail-open:** a company whose cap can't be resolved — a filer with no mapped
 ticker, a symbol Finnhub doesn't cover, a transient API error, or no key set —

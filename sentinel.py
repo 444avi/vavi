@@ -32,9 +32,12 @@ import sentinel_cluster as clu
 import sentinel_config as cfg
 import sentinel_sources as src
 import vavi  # reuse load_env + .env conventions
+from notification_app import (AppStore, DeliveryWorker, sentinel_categories,
+                              sentinel_significance)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_DB = os.path.join(HERE, "sentinel.db")
+DEFAULT_APP_DB = os.path.join(HERE, "app.db")
 
 
 def log(msg):
@@ -540,11 +543,11 @@ def _fmt_cluster_email(c, members, update=False, triage=None):
     return subject, "\n".join(lines)
 
 
-def send_email(subject, body_text, env):
+def send_email(subject, body_text, env, to=None):
     msg = EmailMessage()
     msg["Subject"] = subject
     msg["From"] = env["EMAIL_FROM"]
-    msg["To"] = env["EMAIL_TO"]
+    msg["To"] = to or env["EMAIL_TO"]
     msg.set_content(body_text)
     host = env.get("SMTP_HOST", "smtp.gmail.com")
     port = int(env.get("SMTP_PORT", "587"))
@@ -555,8 +558,46 @@ def send_email(subject, body_text, env):
         s.send_message(msg)
 
 
+def _publish_delivery_event(app_store, c, members, action, triage, env,
+                            no_email, market_cap_usd=None):
+    """Adapt an already-eligible cluster to the shared delivery model."""
+    subject, body_text = _fmt_cluster_email(
+        c, members, update=(action == "update"), triage=triage)
+    if no_email:
+        log(f"  [no-email] would create canonical event: {subject}")
+        return 0
+    event_kind = "update" if action == "update" else "original"
+    latest_version = app_store.latest_event_version("sentinel", c["cluster_id"])
+    promoted_original = action == "alert" and latest_version > 0
+    event_version = latest_version + 1 if action in {"alert", "update"} else 1
+    newest = max(members, key=lambda member: member["observed_at"])
+    result = app_store.publish_event(
+        monitor="sentinel",
+        source_event_id=str(c["cluster_id"]),
+        event_version=event_version,
+        event_kind=event_kind,
+        categories=sentinel_categories(c["event_type"], c["entities"]),
+        direction=(triage or {}).get("direction") or c.get("direction") or "unclear",
+        significance=sentinel_significance(c["impact"]),
+        canonical_tier="immediate" if action else "digest",
+        occurred_at=newest.get("event_time") or c["first_seen"],
+        subject_data={"subject": subject},
+        body_data={
+            "body": body_text,
+            "cluster_id": c["cluster_id"],
+            "event_type": c["event_type"],
+        },
+        market_cap_usd=market_cap_usd,
+        supersede_previous=promoted_original,
+    )
+    if result["created"]:
+        log(f"  canonical event {result['event_id']} created; "
+            f"delivery decisions={result['decisions']}")
+    return 0
+
+
 def score_and_alert(store, cluster_id, is_new, env, no_email,
-                    mark_alerted=True, use_llm=True):
+                    mark_alerted=True, use_llm=True, app_store=None):
     """mark_alerted=False is the dry-run case: log what WOULD be sent without
     recording it as alerted, so a later real pass still emails it. Cold start
     passes True deliberately — the backlog should be suppressed forever."""
@@ -598,14 +639,16 @@ def score_and_alert(store, cluster_id, is_new, env, no_email,
     # LLM calls it would otherwise trigger.
     cold_start_pass = no_email and mark_alerted
 
-    # Market-cap notification gate. Runs only when this event would actually
-    # notify (email / update / digest) so low-tier 'log' items never trigger a
-    # lookup. Only a KNOWN cap below the floor suppresses; unknown caps fall
-    # through (fail-open). Ingestion, clustering, and scoring are untouched.
+    # Resolve once per canonical event, before any per-user decisions. The
+    # result uses Sentinel's Finnhub-backed weekly cache and is persisted on
+    # the event, so a large recipient list never multiplies API traffic.
     would_notify = (tier in ("email", "digest")
                     or (already_alerted and materially_changed))
-    if (cfg.MARKET_CAP_ENABLED and would_notify and not cold_start_pass
-            and below_market_cap_floor(store, c["entities"], env)):
+    market_cap_usd = None
+    if would_notify and not cold_start_pass:
+        market_cap_usd = cluster_market_cap(store, c["entities"], env)
+    if (cfg.MARKET_CAP_ENABLED and market_cap_usd is not None
+            and market_cap_usd < cfg.MARKET_CAP_MIN_USD):
         log(f"  below ${cfg.MARKET_CAP_MIN_USD / 1e9:g}B market-cap floor — "
             f"no notification (cluster #{cluster_id})")
         store.set_cluster_scores(cluster_id, nov, imp, "log")
@@ -619,9 +662,10 @@ def score_and_alert(store, cluster_id, is_new, env, no_email,
     elif already_alerted and materially_changed:
         action = "update"
     elif tier == "digest" and not already_alerted:
-        store.conn.execute(
-            "INSERT OR IGNORE INTO digest_queue VALUES (?,?)",
-            (cluster_id, now_iso()))
+        if app_store is None:
+            store.conn.execute(
+                "INSERT OR IGNORE INTO digest_queue VALUES (?,?)",
+                (cluster_id, now_iso()))
 
     triage = None
     if action and cfg.TRIAGE_ENABLED and use_llm and not cold_start_pass:
@@ -642,10 +686,16 @@ def score_and_alert(store, cluster_id, is_new, env, no_email,
                 f"{triage.get('headline','')[:60]}")
             if not passed:
                 # not worth an email — keep it visible in the daily digest
-                store.conn.execute(
-                    "INSERT OR IGNORE INTO digest_queue VALUES (?,?)",
-                    (cluster_id, now_iso()))
                 store.set_cluster_scores(cluster_id, nov, imp, "digest")
+                c["tier"] = "digest"
+                if app_store is None:
+                    store.conn.execute(
+                        "INSERT OR IGNORE INTO digest_queue VALUES (?,?)",
+                        (cluster_id, now_iso()))
+                else:
+                    _publish_delivery_event(
+                        app_store, c, members, None, triage, env, no_email,
+                        market_cap_usd)
                 return "digest(triaged-out)"
 
     if action:
@@ -653,6 +703,10 @@ def score_and_alert(store, cluster_id, is_new, env, no_email,
             c, members, update=(action == "update"), triage=triage)
         if no_email:
             log(f"  [no-email] would send: {subject}")
+        elif app_store is not None:
+            _publish_delivery_event(
+                app_store, c, members, action, triage, env, no_email,
+                market_cap_usd)
         else:
             try:
                 send_email(subject, body_text, env)
@@ -667,11 +721,20 @@ def score_and_alert(store, cluster_id, is_new, env, no_email,
             "update_count=update_count+? WHERE cluster_id=?",
             (now_iso(), imp, 1 if action == "update" else 0, cluster_id))
         store.touch_entity_alerts(c["entities"])
+    elif tier == "digest" and not already_alerted and app_store is not None:
+        _publish_delivery_event(
+            app_store, c, members, None, triage, env, no_email,
+            market_cap_usd)
     return tier
 
 
-def flush_digest(store, env, no_email, force=False):
+def flush_digest(store, env, no_email, force=False, app_store=None):
     """Send the daily digest when the local hour matches, or on demand."""
+    if app_store is not None:
+        if force and not no_email:
+            DeliveryWorker(app_store, env, logger=log).process_digests(
+                monitor="sentinel", force=True)
+        return
     last = store.kv_get("digest_sent_date")
     today = datetime.now().strftime("%Y-%m-%d")
     if not force:
@@ -755,7 +818,11 @@ def heartbeat(store, source, fetch_ok, n_new, env, no_email):
         log(body)
         if not no_email:
             try:
-                send_email(subject, body, dict(os.environ))
+                admin = env.get("ADMIN_EMAIL_TO")
+                if not admin:
+                    log("heartbeat warning not emailed: ADMIN_EMAIL_TO is unset")
+                else:
+                    send_email(subject, body, dict(os.environ), to=admin)
             except Exception as e:  # noqa: BLE001
                 log(f"heartbeat email error: {e}")
         store.conn.execute(
@@ -765,7 +832,8 @@ def heartbeat(store, source, fetch_ok, n_new, env, no_email):
 # ---------------------------------------------------------------------------
 # Main pass
 # ---------------------------------------------------------------------------
-def run_once(store, env, no_email=False, use_llm=True, only_source=None):
+def run_once(store, env, no_email=False, use_llm=True, only_source=None,
+             app_store=None):
     api_key = env.get("ANTHROPIC_API_KEY", "")
     cik_map = cik_ticker_map(store)
 
@@ -812,7 +880,7 @@ def run_once(store, env, no_email=False, use_llm=True, only_source=None):
             cluster_id, is_new = assign_cluster(store, it, api_key, use_llm)
             store.insert_item(it, cluster_id)
             tier = score_and_alert(store, cluster_id, is_new, env, no_email,
-                                   mark_alerted, use_llm)
+                                   mark_alerted, use_llm, app_store)
             log(f"  + {it['event_type']:<12} {'NEW' if is_new else 'JOIN':<4} "
                 f"c{cluster_id} tier={tier} :: {it['title'][:70]}")
             total_new += 1
@@ -823,7 +891,7 @@ def run_once(store, env, no_email=False, use_llm=True, only_source=None):
     if cold_start:
         # backlog items shouldn't fill the first day's digest either
         store.conn.execute("DELETE FROM digest_queue")
-    flush_digest(store, env, no_email)
+    flush_digest(store, env, no_email, app_store=app_store)
     store.commit()
     log(f"pass complete: {total_new} new item(s)")
     return total_new
@@ -839,11 +907,15 @@ def main(argv=None):
                     help="dry run: score and log, but never send email")
     ap.add_argument("--no-llm", action="store_true",
                     help="skip LLM adjudication (ambiguous pairs -> new cluster)")
+    ap.add_argument("--legacy-delivery", action="store_true",
+                    help="temporary rollback: send directly to EMAIL_TO")
     ap.add_argument("--source", metavar="NAME",
                     help="poll only this source: edgar, nasdaq_halts, nyse_halts")
     ap.add_argument("--digest-now", action="store_true",
                     help="flush the digest queue immediately and exit")
     ap.add_argument("--db", default=DEFAULT_DB, help="SQLite path")
+    ap.add_argument("--app-db", default=DEFAULT_APP_DB,
+                    help="shared users, preferences, events, and deliveries SQLite path")
     ap.add_argument("--env", default=os.path.join(HERE, ".env"),
                     help=".env path (shared with vavi)")
     args = ap.parse_args(argv)
@@ -854,10 +926,13 @@ def main(argv=None):
         log("ERROR: ANTHROPIC_API_KEY missing (or pass --no-llm)")
         sys.exit(2)
     if not args.no_email:
-        missing = [k for k in ("EMAIL_FROM", "EMAIL_TO", "SMTP_PASSWORD")
+        missing = [k for k in ("EMAIL_FROM", "SMTP_PASSWORD")
                    if not env.get(k)]
         if missing:
             log(f"ERROR: missing {', '.join(missing)} (or pass --no-email)")
+            sys.exit(2)
+        if args.legacy_delivery and not env.get("EMAIL_TO"):
+            log("ERROR: legacy delivery requires EMAIL_TO")
             sys.exit(2)
     if cfg.MARKET_CAP_ENABLED and not env.get("FINNHUB_API_KEY"):
         log("WARNING: MARKET_CAP_ENABLED but FINNHUB_API_KEY is unset — market "
@@ -866,23 +941,36 @@ def main(argv=None):
             f"${cfg.MARKET_CAP_MIN_USD / 1e9:g}B floor.")
 
     store = Store(args.db)
+    app_store = AppStore(args.app_db)
     try:
+        app_store.seed_from_env(
+            env,
+            default_timezone=env.get("APP_DEFAULT_TIMEZONE", "America/Los_Angeles"),
+            sentinel_digest_time=f"{cfg.DIGEST_HOUR_LOCAL:02d}:00",
+            sentinel_market_cap_floor=cfg.MARKET_CAP_MIN_USD)
+        if not args.no_email and app_store.get_settings() is None:
+            log("ERROR: no notification user is configured; seed EMAIL_TO once")
+            sys.exit(2)
         if args.digest_now:
-            flush_digest(store, env, args.no_email, force=True)
+            flush_digest(store, env, args.no_email, force=True,
+                         app_store=None if args.legacy_delivery else app_store)
             return
         if args.once:
-            run_once(store, env, args.no_email, not args.no_llm, args.source)
+            run_once(store, env, args.no_email, not args.no_llm, args.source,
+                     None if args.legacy_delivery else app_store)
         else:
             log(f"Sentinel starting forever-loop, poll={cfg.POLL_INTERVAL_SECONDS}s")
             while True:
                 try:
                     run_once(store, env, args.no_email, not args.no_llm,
-                             args.source)
+                             args.source,
+                             None if args.legacy_delivery else app_store)
                 except Exception as e:  # noqa: BLE001
                     log(f"pass error (continuing): {e}")
                 time.sleep(cfg.POLL_INTERVAL_SECONDS)
     finally:
         store.conn.close()
+        app_store.close()
 
 
 if __name__ == "__main__":

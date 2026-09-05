@@ -31,9 +31,11 @@ from email.message import EmailMessage
 
 import config
 import kalshi
+from notification_app import AppStore, vavi_categories
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_DB = os.path.join(HERE, "vavi.db")
+DEFAULT_APP_DB = os.path.join(HERE, "app.db")
 DEFAULT_ENV = os.path.join(HERE, ".env")
 USER_AGENT = "vavi/0.1 (+https://github.com/) market-awareness-monitor"
 
@@ -457,7 +459,7 @@ def cold_start_backfill(store, posts):
     return len(to_mark)
 
 
-def run_once(store, env, no_email=False, classify_enabled=True):
+def run_once(store, env, no_email=False, classify_enabled=True, app_store=None):
     """One full pass. Idempotent: already-seen posts are skipped, so running
     twice is a no-op for the second run."""
     posts = fetch_posts()
@@ -515,9 +517,31 @@ def run_once(store, env, no_email=False, classify_enabled=True):
                 if rel:
                     subj = email_subject(p, classification)
                     vavi_to = vavi_recipient(env)
-                    # 1) The regular email goes out FIRST and UNCHANGED, in its
-                    #    own try/except — Kalshi work below can never touch it.
-                    if not no_email:
+                    if not no_email and app_store is not None:
+                        result = app_store.publish_event(
+                            monitor="vavi",
+                            source_event_id=p["id"],
+                            event_version=1,
+                            event_kind="original",
+                            categories=vavi_categories(classification),
+                            direction=classification.get("direction") or "unclear",
+                            significance=classification.get("magnitude") or "low",
+                            canonical_tier="immediate",
+                            occurred_at=p.get("created_at") or _now_iso(),
+                            subject_data={"subject": subj},
+                            body_data={
+                                "body": email_body(p, classification),
+                                "post": p,
+                                "classification": classification,
+                            },
+                        )
+                        counts = result["decisions"]
+                        if result["created"]:
+                            log(f"  canonical event {result['event_id']} created; "
+                                f"delivery decisions={counts}")
+                    # Compatibility fallback for callers that have not supplied
+                    # app_store. The CLI always supplies it after migration.
+                    elif not no_email:
                         try:
                             send_email(p, classification, env, to=vavi_to)
                             did_notify = True
@@ -526,11 +550,14 @@ def run_once(store, env, no_email=False, classify_enabled=True):
                         except Exception as e:  # noqa: BLE001
                             log(f"  email error: {e}")
                     else:
-                        log(f"  [no-email] would send -> {vavi_to}: {subj}")
+                        if app_store is not None:
+                            log(f"  [no-email] would create a canonical Vavi event: {subj}")
+                        else:
+                            log(f"  [no-email] would send -> {vavi_to}: {subj}")
 
-                    # 2) Second, Kalshi-augmented copy to EMAIL_TO_KS. Fully
-                    #    isolated: any Kalshi failure just drops the section.
-                    if ks_on:
+                    # Legacy-only vavi.ks routing. The settings delivery worker
+                    # enriches once per event and sends one private To address.
+                    if app_store is None and ks_on:
                         section = ""
                         try:
                             section = kalshi.render_section(
@@ -581,7 +608,11 @@ def main(argv=None):
     ap.add_argument("--no-classify", action="store_true",
                     help="skip the LLM; only poll + dedup + pre-filter "
                          "(step-1 testing)")
+    ap.add_argument("--legacy-delivery", action="store_true",
+                    help="temporary rollback: send directly to legacy env lists")
     ap.add_argument("--db", default=DEFAULT_DB, help="SQLite path")
+    ap.add_argument("--app-db", default=DEFAULT_APP_DB,
+                    help="shared users, preferences, events, and deliveries SQLite path")
     ap.add_argument("--env", default=DEFAULT_ENV, help=".env path")
     args = ap.parse_args(argv)
 
@@ -597,29 +628,35 @@ def main(argv=None):
             ["EMAIL_FROM", "SMTP_PASSWORD"],
             "SMTP / email config (or pass --no-email)",
         )
-        # Plain Vavi needs a recipient list: EMAIL_TO_VAVI, or EMAIL_TO as the
-        # fallback / shared "everyone" list.
-        if not vavi_recipient(env):
-            log("ERROR: set EMAIL_TO_VAVI (or EMAIL_TO) in .env, "
-                "or pass --no-email")
+        if args.legacy_delivery and not vavi_recipient(env):
+            log("ERROR: legacy delivery requires EMAIL_TO_VAVI or EMAIL_TO")
             sys.exit(2)
-
     store = Store(args.db)
+    app_store = AppStore(args.app_db)
     try:
+        app_store.seed_from_env(
+            env, default_timezone=env.get("APP_DEFAULT_TIMEZONE", "America/Los_Angeles"))
+        if not args.no_email and app_store.get_settings() is None:
+            log("ERROR: no notification user is configured; seed EMAIL_TO, "
+                "EMAIL_TO_VAVI, or EMAIL_TO_KS once")
+            sys.exit(2)
         if args.once:
             run_once(store, env, no_email=args.no_email,
-                     classify_enabled=classify_enabled)
+                     classify_enabled=classify_enabled,
+                     app_store=None if args.legacy_delivery else app_store)
         else:
             log(f"Vavi starting forever-loop, poll={config.POLL_INTERVAL_SECONDS}s")
             while True:
                 try:
                     run_once(store, env, no_email=args.no_email,
-                             classify_enabled=classify_enabled)
+                             classify_enabled=classify_enabled,
+                             app_store=None if args.legacy_delivery else app_store)
                 except Exception as e:  # noqa: BLE001 — never die on one bad pass
                     log(f"pass error (continuing): {e}")
                 time.sleep(config.POLL_INTERVAL_SECONDS)
     finally:
         store.close()
+        app_store.close()
 
 
 if __name__ == "__main__":
